@@ -22,6 +22,8 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/file.h>
+#include <sys/mount.h>
 
 #include <net/if.h>
 #include <net/if_arp.h>
@@ -59,6 +61,8 @@
 #ifndef IFA_FLAGS
 #define IFA_FLAGS (IFA_MULTICAST + 1)
 #endif
+
+#define NETNS_RUN_DIR "/var/run/netns"
 
 #include <string.h>
 #include <fcntl.h>
@@ -1536,18 +1540,185 @@ int system_macvlan_del(struct device *macvlan)
 	return system_link_del(macvlan->ifname);
 }
 
-int system_netns_open(const pid_t target_ns)
+// BEGIN helper functions taken from iproute2
+
+#define NETNS_RUN_DIR "/var/run/netns"
+
+static int create_netns_dir(void)
 {
-	char pid_net_path[PATH_MAX];
+	/* Create the base netns directory if it doesn't exist */
+	if (mkdir(NETNS_RUN_DIR, S_IRWXU|S_IRGRP|S_IXGRP|S_IROTH|S_IXOTH)) {
+		if (errno != EEXIST) {
+			D(SYSTEM, "mkdir %s failed: %s\n",
+				NETNS_RUN_DIR, strerror(errno));
+			return -1;
+		}
+	}
 
-	snprintf(pid_net_path, sizeof(pid_net_path), "/proc/%u/ns/net", target_ns);
-
-	return open(pid_net_path, O_RDONLY);
+	return 0;
 }
 
-int system_netns_set(int netns_fd)
+static int saved_netns = -1;
+
+/* Obtain a FD for the current namespace, so we can reenter it later */
+static void netns_save(void)
 {
-	return setns(netns_fd, CLONE_NEWNET);
+	if (saved_netns != -1)
+		return;
+
+	saved_netns = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
+	if (saved_netns == -1) {
+		D(SYSTEM, "Cannot open init namespace: %s", strerror(errno));
+		exit(1);
+	}
+}
+
+static void netns_restore(void)
+{
+	if (saved_netns == -1)
+		return;
+
+	if (setns(saved_netns, CLONE_NEWNET)) {
+		D(SYSTEM, "Failed to restore netns: %s", strerror(errno));
+		exit(1);
+	}
+
+	close(saved_netns);
+	saved_netns = -1;
+}
+
+static int netns_delete(const char *nsname)
+{
+	// inlined code from on_netns_del here
+
+	char netns_path[PATH_MAX];
+
+	snprintf(netns_path, sizeof(netns_path), "%s/%s", NETNS_RUN_DIR, nsname);
+	umount2(netns_path, MNT_DETACH);
+	if (unlink(netns_path) < 0) {
+		D(SYSTEM, "Cannot remove namespace file \"%s\": %s\n",
+			netns_path, strerror(errno));
+		return -1;
+	}
+	return 0;
+}
+
+// END helper functions taken from iproute2
+
+
+int system_netns_add(const char *name)
+{
+
+// BEGIN code taken from iproute2 ipnetns.c netns_add(), then adjusted to work here.
+
+	/* This function creates a new network namespace and
+	 * a new mount namespace and bind them into a well known
+	 * location in the filesystem based on the name provided.
+	 *
+	 * The mount namespace is created so that any necessary
+	 * userspace tweaks like remounting /sys, or bind mounting
+	 * a new /etc/resolv.conf can be shared between users.
+	 */
+	char netns_path[PATH_MAX], proc_path[PATH_MAX];
+	int fd;
+	int lock;
+	int made_netns_run_dir_mount = 0;
+
+	snprintf(netns_path, sizeof(netns_path), "%s/%s", NETNS_RUN_DIR, name);
+
+	if (create_netns_dir())
+		return -1;
+
+	/* Make it possible for network namespace mounts to propagate between
+	 * mount namespaces.  This makes it likely that a unmounting a network
+	 * namespace file in one namespace will unmount the network namespace
+	 * file in all namespaces allowing the network namespace to be freed
+	 * sooner.
+	 * These setup steps need to happen only once, as if multiple ip processes
+	 * try to attempt the same operation at the same time, the mountpoints will
+	 * be recursively created multiple times, eventually causing the system
+	 * to lock up. For example, this has been observed when multiple netns
+	 * namespaces are created in parallel at boot. See:
+	 * https://bugs.debian.org/949235
+	 * Try to take an exclusive file lock on the top level directory to ensure
+	 * this cannot happen, but proceed nonetheless if it cannot happen for any
+	 * reason.
+	 */
+	lock = open(NETNS_RUN_DIR, O_RDONLY|O_DIRECTORY, 0);
+	if (lock < 0) {
+		D(SYSTEM, "Cannot open netns runtime directory \"%s\": %s\n",
+			NETNS_RUN_DIR, strerror(errno));
+		return -1;
+	}
+	if (flock(lock, LOCK_EX) < 0) {
+		D(SYSTEM, "Warning: could not flock netns runtime directory \"%s\": %s\n",
+			NETNS_RUN_DIR, strerror(errno));
+		close(lock);
+		lock = -1;
+	}
+	while (mount("", NETNS_RUN_DIR, "none", MS_SHARED | MS_REC, NULL)) {
+		/* Fail unless we need to make the mount point */
+		if (errno != EINVAL || made_netns_run_dir_mount) {
+			D(SYSTEM, "mount --make-shared %s failed: %s\n",
+				NETNS_RUN_DIR, strerror(errno));
+			if (lock != -1) {
+				flock(lock, LOCK_UN);
+				close(lock);
+			}
+			return -1;
+		}
+
+		/* Upgrade NETNS_RUN_DIR to a mount point */
+		if (mount(NETNS_RUN_DIR, NETNS_RUN_DIR, "none", MS_BIND | MS_REC, NULL)) {
+			D(SYSTEM, "mount --bind %s %s failed: %s\n",
+				NETNS_RUN_DIR, NETNS_RUN_DIR, strerror(errno));
+			if (lock != -1) {
+				flock(lock, LOCK_UN);
+				close(lock);
+			}
+			return -1;
+		}
+		made_netns_run_dir_mount = 1;
+	}
+	if (lock != -1) {
+		flock(lock, LOCK_UN);
+		close(lock);
+	}
+
+	/* Create the filesystem state */
+	fd = open(netns_path, O_RDONLY|O_CREAT|O_EXCL, 0);
+	if (fd < 0) {
+		D(SYSTEM, "Cannot create namespace file \"%s\": %s\n",
+			netns_path, strerror(errno));
+		return -1;
+	}
+	close(fd);
+
+	netns_save();
+	if (unshare(CLONE_NEWNET) < 0) {
+		D(SYSTEM, "Failed to create a new network namespace \"%s\": %s\n",
+			name, strerror(errno));
+		goto out_delete;
+	}
+
+	strcpy(proc_path, "/proc/self/ns/net");
+
+	/* Bind the netns last so I can watch for it */
+	if (mount(proc_path, netns_path, "none", MS_BIND, NULL) < 0) {
+		D(SYSTEM, "Bind %s -> %s failed: %s\n",
+			proc_path, netns_path, strerror(errno));
+		goto out_delete;
+	}
+	netns_restore();
+
+	return 0;
+out_delete:
+	netns_restore();
+	netns_delete(name);
+	return -1;
+
+// END code taken from iproute2 ipnetns.c
+	
 }
 
 int system_veth_add(struct device *veth, struct veth_config *cfg)

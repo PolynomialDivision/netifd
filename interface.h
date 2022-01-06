@@ -111,6 +111,7 @@ struct interface {
 	char *jail;
 	char *jail_device;
 	char *host_device;
+	char *netns;
 	int netns_fd;
 
 	bool available;
