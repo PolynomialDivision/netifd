@@ -827,6 +827,9 @@ netifd_dump_status(struct interface *iface)
 	if (iface->jail_device)
 		blobmsg_add_string(&b, "jail_device", iface->jail_device);
 
+	if (iface->netns)
+		blobmsg_add_string(&b, "netns", iface->netns);
+
 	if (iface->state == IFS_UP) {
 		if (iface->updated) {
 			a = blobmsg_open_array(&b, "updated");
